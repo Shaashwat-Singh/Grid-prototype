@@ -6,18 +6,18 @@ execution. Every action must pass through GRID's policy gate before it can
 touch the execution layer.
 """
 
-from grid.intent_contract import IntentContract
-from grid.policy_engine import PolicyEngine, PolicyResult, PolicyVerdict
-from grid.audit_log import AuditLog, AuditEntry
-from grid.enforcement_gate import EnforcementGate
+from grid.intent_contract import IntentContract, create_demo_contract
+from grid.policy_engine import PolicyEngine, ActionRequest, EnforcementDecision
+from grid.audit_log import AuditLog
+from grid.enforcement_gate import GRIDEnforcementGate
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "IntentContract",
+    "create_demo_contract",
     "PolicyEngine",
-    "PolicyResult",
-    "PolicyVerdict",
+    "ActionRequest",
+    "EnforcementDecision",
     "AuditLog",
-    "AuditEntry",
-    "EnforcementGate",
+    "GRIDEnforcementGate",
 ]

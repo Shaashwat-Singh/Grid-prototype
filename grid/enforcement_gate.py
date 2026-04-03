@@ -1,349 +1,243 @@
 """
-EnforcementGate — The single point of control between reasoning and execution.
-
-The EnforcementGate is the core of GRID. It:
-    1. Receives ActionRequests from agents
-    2. Invokes the PolicyEngine for evaluation
-    3. Writes the decision to the AuditLog (BEFORE execution)
-    4. Executes allowed actions via the Alpaca API (gate holds all credentials)
-    5. Returns results to the requesting agent
-    6. Blocks and logs all denied actions
-
-Key invariant: Agents NEVER have direct API access.
-The gate is the only component with execution credentials.
+GRID Enforcement Gate
+The only path between agent action requests and financial execution.
+Agents have NO direct access to Alpaca. The gate holds all credentials.
 """
 
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
-
+import alpaca_trade_api as tradeapi
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
-from grid.audit_log import AuditLog
 from grid.intent_contract import IntentContract
-from grid.policy_engine import ActionRequest, PolicyEngine, PolicyResult, PolicyVerdict
+from grid.policy_engine import PolicyEngine, ActionRequest, EnforcementDecision
+from grid.audit_log import AuditLog
 
 load_dotenv()
 
 
-class ExecutionResult:
-    """Result of processing an action request through the gate."""
-    
-    def __init__(
-        self,
-        allowed: bool,
-        verdict: str,
-        policy_result: PolicyResult,
-        execution_data: Optional[Dict] = None,
-        error: Optional[str] = None,
-    ):
-        self.allowed = allowed
-        self.verdict = verdict
-        self.policy_result = policy_result
-        self.execution_data = execution_data
-        self.error = error
-    
-    def __repr__(self):
-        return (
-            f"ExecutionResult(allowed={self.allowed}, verdict={self.verdict}, "
-            f"data={self.execution_data}, error={self.error})"
-        )
-    
-    def to_dict(self) -> Dict:
-        return {
-            "allowed": self.allowed,
-            "verdict": self.verdict,
-            "policy_summary": self.policy_result.summary(),
-            "execution_data": self.execution_data,
-            "error": self.error,
-        }
-
-
-class EnforcementGate:
+class GRIDEnforcementGate:
     """
-    Constitutional enforcement gate for GRID.
-    
-    All agent action requests must pass through this gate. The gate:
-    - Evaluates requests against the IntentContract via PolicyEngine
-    - Logs all decisions to the AuditLog before execution
-    - Executes allowed trade actions via Alpaca Paper API
-    - Blocks and logs all denied actions
-    
-    The gate holds all API credentials. Agents receive a reference
-    to the gate, never to the API directly.
-    
-    Example:
-        >>> gate = EnforcementGate(contract, audit_log)
-        >>> request = ActionRequest(
-        ...     agent_id="trader_001",
-        ...     agent_role="trader",
-        ...     action_type="trade",
-        ...     ticker="AAPL",
-        ...     side="buy",
-        ...     quantity=50,
-        ...     estimated_value=8500.0
-        ... )
-        >>> result = gate.process(request)
-        >>> result.allowed
-        True
+    Constitutional enforcement gate for financial AI agents.
+
+    Architectural guarantees:
+    1. No agent holds Alpaca credentials — only the gate does
+    2. Every action_request is evaluated against IntentContract before execution
+    3. Every decision (ALLOW and BLOCK) is written to audit log
+    4. Blocked actions never reach the execution layer
+    5. The gate cannot be instructed to bypass its own enforcement
     """
-    
-    def __init__(
-        self,
-        contract: IntentContract,
-        audit_log: Optional[AuditLog] = None,
-        alpaca_api_key: Optional[str] = None,
-        alpaca_secret_key: Optional[str] = None,
-        alpaca_base_url: Optional[str] = None,
-        dry_run: bool = True,
-    ):
-        """
-        Initialize the EnforcementGate.
-        
-        Args:
-            contract: The signed IntentContract to enforce.
-            audit_log: AuditLog instance (creates default if None).
-            alpaca_api_key: Alpaca API key (falls back to env var).
-            alpaca_secret_key: Alpaca secret key (falls back to env var).
-            alpaca_base_url: Alpaca base URL (falls back to env var).
-            dry_run: If True, simulate execution without hitting Alpaca API.
-        """
-        # Validate contract
-        if not contract.is_signed:
-            raise ValueError("EnforcementGate requires a signed IntentContract.")
+
+    def __init__(self, contract: IntentContract):
         if not contract.verify_integrity():
-            raise ValueError("Contract integrity verification failed.")
-        
+            raise ValueError("IntentContract integrity check failed — contract may have been tampered with")
+
         self.contract = contract
-        self.policy_engine = PolicyEngine(contract)
-        self.audit_log = audit_log or AuditLog()
-        self.dry_run = dry_run
-        
-        # Credential isolation: only the gate holds API keys
-        self._alpaca_api_key = alpaca_api_key or os.getenv("ALPACA_API_KEY")
-        self._alpaca_secret_key = alpaca_secret_key or os.getenv("ALPACA_SECRET_KEY")
-        self._alpaca_base_url = alpaca_base_url or os.getenv(
-            "ALPACA_BASE_URL", "https://paper-api.alpaca.markets"
+        self.policy = PolicyEngine(contract)
+        self.audit = AuditLog()
+
+        # Gate holds all execution credentials — agents never see these
+        self._alpaca = tradeapi.REST(
+            os.getenv("ALPACA_API_KEY", ""),
+            os.getenv("ALPACA_SECRET_KEY", ""),
+            os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
         )
-        
-        # Initialize Alpaca client (lazy)
-        self._alpaca_client = None
-        
-        # Statistics
-        self._stats = {
-            "total_requests": 0,
-            "allowed": 0,
-            "blocked": 0,
-            "errors": 0,
-        }
-    
-    def _get_alpaca_client(self):
-        """Lazy-initialize the Alpaca trading client."""
-        if self._alpaca_client is None and not self.dry_run:
-            try:
-                import alpaca_trade_api as tradeapi
-                self._alpaca_client = tradeapi.REST(
-                    key_id=self._alpaca_api_key,
-                    secret_key=self._alpaca_secret_key,
-                    base_url=self._alpaca_base_url,
-                )
-            except ImportError:
-                raise RuntimeError(
-                    "alpaca-trade-api is required for live execution. "
-                    "Install with: pip install alpaca-trade-api"
-                )
-            except Exception as e:
-                raise RuntimeError(f"Failed to initialize Alpaca client: {e}")
-        return self._alpaca_client
-    
-    def process(self, request: ActionRequest) -> ExecutionResult:
-        """
-        Process an action request through the enforcement gate.
-        
-        This is the main entry point. The flow is:
-        1. Evaluate against PolicyEngine
-        2. Log decision to AuditLog (BEFORE execution)
-        3. If allowed and trade: execute via Alpaca
-        4. Return result
-        
-        Args:
-            request: The ActionRequest from an agent.
-            
-        Returns:
-            ExecutionResult with verdict, policy details, and execution data.
-        """
-        self._stats["total_requests"] += 1
-        
-        # Step 1: Evaluate against policy engine
-        policy_result = self.policy_engine.evaluate(request)
-        
-        # Step 2: Determine action details for logging
-        action_details = {
-            "agent_id": request.agent_id,
-            "agent_role": request.agent_role,
-            "action_type": request.action_type,
-            "ticker": request.ticker,
-            "side": request.side,
-            "quantity": request.quantity,
-            "order_type": request.order_type,
-            "estimated_value": request.estimated_value,
-            "tool_name": request.tool_name,
-            "file_path": request.file_path,
-            "delegation_depth": request.delegation_depth,
-        }
-        
-        policy_results_dicts = [
-            {
-                "rule": r.rule_name,
-                "passed": r.passed,
-                "reason": r.reason,
-            }
-            for r in policy_result.rule_results
-        ]
-        
-        execution_data = None
-        error = None
-        
-        if policy_result.is_allowed:
-            self._stats["allowed"] += 1
-            
-            # Step 3: Execute if allowed and it's a trade
-            if request.action_type == "trade":
-                try:
-                    execution_data = self._execute_trade(request)
-                except Exception as e:
-                    error = str(e)
-                    self._stats["errors"] += 1
-            elif request.action_type == "data_access":
-                execution_data = {"status": "data_access_granted", "path": request.file_path}
-            elif request.action_type == "tool_use":
-                execution_data = {"status": "tool_use_granted", "tool": request.tool_name}
-            else:
-                execution_data = {"status": "action_allowed"}
-        else:
-            self._stats["blocked"] += 1
-        
-        # Step 4: Log to audit trail (BEFORE returning result)
-        self.audit_log.record(
-            agent_id=request.agent_id,
-            agent_role=request.agent_role,
-            action_type=request.action_type,
-            action_details=action_details,
-            contract_id=self.contract.contract_id,
-            policy_results=policy_results_dicts,
-            verdict=policy_result.verdict.value,
-            block_reasons=policy_result.block_reasons,
-            execution_result=execution_data,
+
+        print(f"[GRID] Gate initialized for session: {contract.session_id}")
+        print(f"[GRID] Contract hash: {contract.compute_hash()}")
+        print(f"[GRID] Paper trading only: {contract.paper_trading_only}")
+
+    def request_market_data(self, agent_id: str, ticker: str) -> Dict[str, Any]:
+        """Read-only market data — always permitted for registered agents."""
+        req = ActionRequest(
+            agent_id=agent_id,
+            action_type="use_tool",
+            tool_name="get_market_data",
+            session_id=self.contract.session_id,
+            ticker=ticker,
+            raw_params=f"ticker={ticker}"
         )
-        
-        return ExecutionResult(
-            allowed=policy_result.is_allowed,
-            verdict=policy_result.verdict.value,
-            policy_result=policy_result,
-            execution_data=execution_data,
-            error=error,
-        )
-    
-    def _execute_trade(self, request: ActionRequest) -> Dict:
-        """
-        Execute a trade via the Alpaca Paper API.
-        
-        Only called for ALLOWED trade requests. The gate holds the credentials.
-        
-        Args:
-            request: The validated ActionRequest.
-            
-        Returns:
-            Execution result dictionary.
-        """
-        if self.dry_run:
-            return {
-                "status": "simulated",
-                "mode": "dry_run",
-                "ticker": request.ticker,
-                "side": request.side,
-                "quantity": request.quantity,
-                "order_type": request.order_type or "market",
-                "estimated_value": request.estimated_value,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "message": f"[DRY RUN] Would place {request.side} order for {request.quantity} shares of {request.ticker}",
-            }
-        
-        # Live execution via Alpaca
-        client = self._get_alpaca_client()
-        if client is None:
-            return {
-                "status": "error",
-                "message": "Alpaca client not available",
-            }
-        
+
+        decision = self.policy.evaluate(req)
+        self.audit.record(decision)
+
+        if decision.result == "BLOCK":
+            return {"status": "BLOCKED", "reason": decision.reason}
+
         try:
-            order = client.submit_order(
-                symbol=request.ticker,
-                qty=request.quantity,
-                side=request.side,
-                type=request.order_type or "market",
-                time_in_force="day",
-                limit_price=request.limit_price if request.order_type == "limit" else None,
-            )
-            
+            bar = self._alpaca.get_latest_bar(ticker)
+            latest_trade = self._alpaca.get_latest_trade(ticker)
             return {
-                "status": "executed",
-                "mode": "paper",
-                "order_id": str(order.id),
-                "ticker": request.ticker,
-                "side": request.side,
-                "quantity": request.quantity,
-                "order_type": request.order_type or "market",
-                "order_status": str(order.status),
-                "submitted_at": str(order.submitted_at),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "ALLOWED",
+                "ticker": ticker,
+                "price": float(latest_trade.price),
+                "close": float(bar.c),
+                "volume": int(bar.v),
+                "timestamp": str(bar.t)
             }
         except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+
+    def request_trade(
+        self,
+        agent_id: str,
+        ticker: str,
+        quantity: int,
+        side: str,
+        price_hint: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Submit a trade request through the enforcement gate.
+        The gate evaluates the request, then — only if approved — executes via Alpaca.
+        """
+        # Estimate order value for policy evaluation
+        try:
+            if price_hint is None:
+                latest = self._alpaca.get_latest_trade(ticker)
+                price_hint = float(latest.price)
+        except Exception:
+            price_hint = 150.0  # Conservative fallback for demo
+
+        order_value = price_hint * quantity
+
+        req = ActionRequest(
+            agent_id=agent_id,
+            action_type="place_trade",
+            session_id=self.contract.session_id,
+            ticker=ticker,
+            quantity=quantity,
+            side=side,
+            order_value_usd=order_value,
+            raw_params=f"ticker={ticker} qty={quantity} side={side} est_value=${order_value:.2f}"
+        )
+
+        decision = self.policy.evaluate(req)
+        self.audit.record(decision)
+
+        if decision.result == "BLOCK":
             return {
-                "status": "execution_error",
-                "error": str(e),
-                "ticker": request.ticker,
-                "side": request.side,
-                "quantity": request.quantity,
+                "status": "BLOCKED",
+                "reason": decision.reason,
+                "policy_violated": decision.policy_violated,
+                "requested": {"ticker": ticker, "quantity": quantity, "side": side}
             }
-    
-    def get_stats(self) -> Dict:
-        """Get gate processing statistics."""
-        return {
-            **self._stats,
-            "block_rate": (
-                f"{(self._stats['blocked'] / self._stats['total_requests'] * 100):.1f}%"
-                if self._stats["total_requests"] > 0 else "0%"
-            ),
-            "audit_entries": self.audit_log.entry_count,
-            "chain_integrity": self.audit_log.verify_chain(),
-            "dry_run_mode": self.dry_run,
-        }
-    
-    def get_audit_stats(self) -> Dict:
-        """Get audit log statistics."""
-        return self.audit_log.get_stats()
-    
-    def verify_system_integrity(self) -> Dict:
+
+        # Execute only after enforcement approval
+        try:
+            order = self._alpaca.submit_order(
+                symbol=ticker,
+                qty=quantity,
+                side=side,
+                type="market",
+                time_in_force="day"
+            )
+            return {
+                "status": "EXECUTED",
+                "order_id": str(order.id),
+                "ticker": ticker,
+                "quantity": quantity,
+                "side": side,
+                "estimated_value": f"${order_value:.2f}",
+                "alpaca_status": order.status
+            }
+        except Exception as e:
+            return {"status": "EXECUTION_ERROR", "message": str(e)}
+
+    def request_tool(
+        self,
+        agent_id: str,
+        tool_name: str,
+        parameters: str = "",
+        raw_content: str = ""
+    ) -> Dict[str, Any]:
         """
-        Run a complete system integrity check.
-        
-        Verifies:
-        1. Contract integrity (hash)
-        2. Audit chain integrity (hash chain)
-        3. Gate credential status
-        
-        Returns:
-            Dictionary with integrity check results.
+        Request to invoke a tool. Gate evaluates against tool restrictions
+        and injection patterns before any execution.
         """
-        contract_ok = self.contract.verify_integrity()
-        chain_ok = self.audit_log.verify_chain()
-        creds_present = bool(self._alpaca_api_key and self._alpaca_secret_key)
-        
+        req = ActionRequest(
+            agent_id=agent_id,
+            action_type="use_tool",
+            session_id=self.contract.session_id,
+            tool_name=tool_name,
+            tool_parameters=parameters,
+            raw_content=raw_content,
+            raw_params=f"tool={tool_name} params={parameters[:200]}"
+        )
+
+        decision = self.policy.evaluate(req)
+        self.audit.record(decision)
+
         return {
-            "contract_integrity": "✓ VALID" if contract_ok else "✗ TAMPERED",
-            "audit_chain_integrity": "✓ VALID" if chain_ok else "✗ BROKEN",
-            "credentials_loaded": "✓ YES" if creds_present else "○ NO (dry run only)",
-            "overall": "HEALTHY" if (contract_ok and chain_ok) else "COMPROMISED",
+            "status": decision.result,
+            "reason": decision.reason,
+            "policy_violated": decision.policy_violated
         }
+
+    def request_delegation(
+        self,
+        from_agent: str,
+        to_agent: str,
+        scope: list
+    ) -> Dict[str, Any]:
+        """
+        Request to delegate authority from one agent to another.
+        Delegation bounds are enforced by policy.
+        """
+        req = ActionRequest(
+            agent_id=from_agent,
+            action_type="delegate",
+            session_id=self.contract.session_id,
+            delegate_to=to_agent,
+            delegated_scope=scope,
+            raw_params=f"from={from_agent} to={to_agent} scope={scope}"
+        )
+
+        decision = self.policy.evaluate(req)
+        self.audit.record(decision)
+
+        return {
+            "status": decision.result,
+            "reason": decision.reason,
+            "delegation": {"from": from_agent, "to": to_agent, "scope": scope}
+        }
+
+    def get_portfolio(self, agent_id: str) -> Dict[str, Any]:
+        """Retrieve current paper portfolio."""
+        req = ActionRequest(
+            agent_id=agent_id,
+            action_type="use_tool",
+            tool_name="get_portfolio",
+            session_id=self.contract.session_id,
+        )
+        decision = self.policy.evaluate(req)
+        self.audit.record(decision)
+
+        if decision.result == "BLOCK":
+            return {"status": "BLOCKED", "reason": decision.reason}
+
+        try:
+            account = self._alpaca.get_account()
+            positions = self._alpaca.list_positions()
+            return {
+                "status": "ALLOWED",
+                "equity": float(account.equity),
+                "cash": float(account.cash),
+                "buying_power": float(account.buying_power),
+                "positions": [
+                    {
+                        "ticker": p.symbol,
+                        "qty": int(p.qty),
+                        "market_value": float(p.market_value),
+                        "unrealized_pl": float(p.unrealized_pl)
+                    }
+                    for p in positions
+                ]
+            }
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+
+    def get_audit_log(self, limit: int = 20) -> list:
+        return self.audit.get_recent(limit=limit, session_id=self.contract.session_id)
+
+    def get_stats(self) -> dict:
+        return self.audit.get_stats(session_id=self.contract.session_id)

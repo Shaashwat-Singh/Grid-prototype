@@ -1,508 +1,274 @@
 """
-PolicyEngine — Deterministic rule-chain evaluator for GRID.
-
-The PolicyEngine evaluates every ActionRequest against the IntentContract
-through a deterministic rule chain. All rules must pass for an action to
-be allowed. One failure = BLOCK.
-
-Rule evaluation order:
-    1. Agent authorization
-    2. Ticker universe validation
-    3. Per-order size limit
-    4. Daily aggregate limit
-    5. Tool permission check
-    6. Data access scope
-    7. Delegation depth check
-    8. Prompt injection detection
-    9. Market hours constraint
-    10. Order type validation
-
-Design principles:
-    - Fail-closed: any ambiguity defaults to BLOCK
-    - Deterministic: same input always produces same output
-    - Complete: every action type has applicable rules
-    - Auditable: every rule evaluation is captured in the result
+GRID Policy Engine
+Deterministic evaluation of agent action requests against the Intent Contract.
+No LLM involved in enforcement decisions. Pure policy logic.
 """
 
+from dataclasses import dataclass, field
+from typing import Optional, List
+from datetime import datetime, time
 import re
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Dict, List, Optional
-
-from pydantic import BaseModel, Field
 
 from grid.intent_contract import IntentContract
 
 
-class PolicyVerdict(str, Enum):
-    """Final verdict of a policy evaluation."""
-    ALLOW = "ALLOW"
-    BLOCK = "BLOCK"
+@dataclass
+class ActionRequest:
+    """Structured representation of what an agent wants to do."""
+    agent_id: str
+    action_type: str          # "place_trade" | "use_tool" | "read_file" | "delegate"
+    session_id: str
 
-
-class RuleResult(BaseModel):
-    """Result of a single policy rule evaluation."""
-    rule_name: str = Field(..., description="Name of the policy rule")
-    passed: bool = Field(..., description="Whether the rule passed")
-    reason: str = Field(..., description="Human-readable explanation")
-    severity: str = Field(default="hard", description="'hard' (blocking) or 'soft' (advisory)")
-
-
-class PolicyResult(BaseModel):
-    """Aggregate result of all policy rule evaluations."""
-    verdict: PolicyVerdict = Field(..., description="Final verdict: ALLOW or BLOCK")
-    rule_results: List[RuleResult] = Field(default_factory=list, description="Individual rule evaluations")
-    block_reasons: List[str] = Field(default_factory=list, description="Reasons for blocking (if blocked)")
-    evaluated_at: str = Field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
-        description="Timestamp of evaluation"
-    )
-    
-    @property
-    def is_allowed(self) -> bool:
-        return self.verdict == PolicyVerdict.ALLOW
-    
-    def summary(self) -> str:
-        """Human-readable summary of the policy evaluation."""
-        lines = [f"Verdict: {self.verdict.value}"]
-        for r in self.rule_results:
-            icon = "✓" if r.passed else "✗"
-            lines.append(f"  {icon} {r.rule_name}: {r.reason}")
-        if self.block_reasons:
-            lines.append(f"  Block reasons: {'; '.join(self.block_reasons)}")
-        return "\n".join(lines)
-
-
-class ActionRequest(BaseModel):
-    """
-    An action that an agent wants to perform.
-    
-    All agent actions are submitted as ActionRequests to the EnforcementGate.
-    The PolicyEngine evaluates each request against the IntentContract.
-    """
-    agent_id: str = Field(..., description="Identifier of the requesting agent")
-    agent_role: str = Field(..., description="Role of the requesting agent (e.g., 'trader')")
-    action_type: str = Field(..., description="Type: 'trade', 'data_access', 'tool_use', 'delegation'")
-    
     # Trade-specific fields
-    ticker: Optional[str] = Field(default=None, description="Ticker symbol for trade actions")
-    side: Optional[str] = Field(default=None, description="Trade side: 'buy' or 'sell'")
-    quantity: Optional[int] = Field(default=None, description="Number of shares")
-    order_type: Optional[str] = Field(default=None, description="Order type: 'market', 'limit', etc.")
-    limit_price: Optional[float] = Field(default=None, description="Limit price (for limit orders)")
-    estimated_value: Optional[float] = Field(default=None, description="Estimated total order value in USD")
-    
-    # Tool/data access fields
-    tool_name: Optional[str] = Field(default=None, description="Name of the tool being invoked")
-    file_path: Optional[str] = Field(default=None, description="File path for data access requests")
-    
+    ticker: Optional[str] = None
+    quantity: Optional[int] = None
+    side: Optional[str] = None          # "buy" | "sell"
+    order_value_usd: Optional[float] = None
+
+    # Tool-specific fields
+    tool_name: Optional[str] = None
+    tool_parameters: str = ""           # Raw parameter string — checked for injection
+
+    # File access fields
+    file_path: Optional[str] = None
+
     # Delegation fields
-    delegation_depth: int = Field(default=0, description="Current delegation depth")
-    delegated_from: Optional[str] = Field(default=None, description="Agent that delegated this request")
-    
-    # Raw content for injection detection
-    raw_reasoning: Optional[str] = Field(default=None, description="Raw LLM output that led to this action")
+    delegate_to: Optional[str] = None
+    delegated_scope: Optional[List[str]] = None
+
+    # Raw content from agent (used for injection detection)
+    raw_content: str = ""
+
+    # Serialized parameter string for audit logging
+    raw_params: str = ""
+
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
-# --- Prompt Injection Patterns ---
+@dataclass
+class PolicyCheck:
+    passed: bool
+    policy_name: str
+    detail: str = ""
+
+
+@dataclass
+class EnforcementDecision:
+    result: str                    # "ALLOW" | "BLOCK"
+    action_request: ActionRequest
+    reason: str
+    policy_violated: Optional[str]
+    checks_run: List[PolicyCheck]
+    timestamp: str
+    is_deterministic: bool = True  # Always True — enforcement never uses LLM
+
+
 INJECTION_PATTERNS = [
-    r"ignore\s+(previous|above|all)\s+(instructions|rules|constraints)",
-    r"you\s+are\s+now\s+(a|an)\s+",
-    r"disregard\s+(your|the)\s+(rules|policy|constraints|guidelines)",
-    r"override\s+(safety|policy|rules|constraints)",
-    r"pretend\s+(you|that)\s+(are|can|have)",
-    r"jailbreak",
-    r"do\s+anything\s+now",
-    r"bypass\s+(the\s+)?(filter|safety|policy|rules)",
-    r"system\s*prompt",
-    r"act\s+as\s+(if|though)\s+you\s+(have|are)",
+    r"override\s+(trade\s+)?limit",
+    r"ignore\s+previous\s+instruction",
+    r"bypass\s+enforcement",
+    r"disable\s+(policy|guard|enforcement)",
+    r"system\s*:",
+    r"admin\s*:",
+    r"escalate\s+authority",
+    r"you\s+are\s+now\s+allowed",
     r"new\s+instructions?\s*:",
-    r"<<<\s*system",
-    r"admin\s+mode",
+    r"forget\s+(previous|prior|all)",
     r"sudo\s+",
-    r"execute\s+without\s+(checking|validation|verification)",
+    r"execute\s+as\s+root",
 ]
-
-COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
 
 
 class PolicyEngine:
     """
-    Constitutional policy evaluator for GRID.
-    
-    Evaluates ActionRequests against an IntentContract through a deterministic
-    rule chain. All rules must pass for an action to be allowed.
-    
-    Example:
-        >>> engine = PolicyEngine(contract)
-        >>> request = ActionRequest(
-        ...     agent_id="trader_001",
-        ...     agent_role="trader",
-        ...     action_type="trade",
-        ...     ticker="AAPL",
-        ...     side="buy",
-        ...     quantity=50,
-        ...     estimated_value=8500.0
-        ... )
-        >>> result = engine.evaluate(request)
-        >>> result.verdict
-        <PolicyVerdict.ALLOW: 'ALLOW'>
+    Evaluates every ActionRequest against the IntentContract.
+
+    Key properties:
+    - Deterministic: same input always produces same output
+    - Autonomous: no human approval needed at runtime
+    - Transparent: every decision includes full reasoning
+    - Conservative: any single failed check blocks the action
     """
-    
+
     def __init__(self, contract: IntentContract):
-        """
-        Initialize the PolicyEngine with an IntentContract.
-        
-        Args:
-            contract: The signed IntentContract to enforce.
-            
-        Raises:
-            ValueError: If the contract is not signed or integrity check fails.
-        """
-        if not contract.is_signed:
-            raise ValueError("PolicyEngine requires a signed IntentContract.")
-        if not contract.verify_integrity():
-            raise ValueError("IntentContract integrity check failed. Possible tampering detected.")
-        
         self.contract = contract
-        self._daily_totals: Dict[str, float] = {}  # agent_id -> daily total
-        self._daily_date: Optional[str] = None
-    
-    def evaluate(self, request: ActionRequest) -> PolicyResult:
+        self._daily_spent: float = 0.0
+        self._session_id = contract.session_id
+
+    def evaluate(self, request: ActionRequest) -> EnforcementDecision:
         """
-        Evaluate an ActionRequest against the IntentContract.
-        
-        Runs the complete rule chain. All rules must pass for ALLOW.
-        First failure short-circuits to BLOCK.
-        
-        Args:
-            request: The action request to evaluate.
-            
-        Returns:
-            PolicyResult with verdict and individual rule evaluations.
+        Main evaluation entrypoint. All agent actions must pass through here.
+        Returns ALLOW or BLOCK with full audit trail.
         """
-        rule_results: List[RuleResult] = []
-        block_reasons: List[str] = []
-        
-        # Define the rule chain
-        rules = [
-            ("contract_integrity", self._check_contract_integrity),
-            ("agent_authorization", self._check_agent_authorization),
+        checks = [
+            self._check_agent_registered(request),
+            self._check_action_in_agent_scope(request),
+            self._check_tool_not_forbidden(request),
+            self._check_injection_patterns(request),
+            self._check_ticker_restriction(request),
+            self._check_per_order_size(request),
+            self._check_daily_limit(request),
+            self._check_share_quantity(request),
+            self._check_file_access_scope(request),
+            self._check_delegation_bounds(request),
         ]
-        
-        # Add action-type-specific rules
-        if request.action_type == "trade":
-            rules.extend([
-                ("ticker_check", self._check_ticker),
-                ("order_size_check", self._check_order_size),
-                ("daily_limit_check", self._check_daily_limit),
-                ("order_type_check", self._check_order_type),
-                ("trade_side_check", self._check_trade_side),
-                ("market_hours_check", self._check_market_hours),
-            ])
-        
-        if request.action_type in ("trade", "tool_use"):
-            rules.append(("tool_permission_check", self._check_tool_permission))
-        
-        if request.action_type == "data_access":
-            rules.append(("data_scope_check", self._check_data_scope))
-        
-        if request.action_type == "delegation":
-            rules.append(("delegation_depth_check", self._check_delegation_depth))
-        
-        # Always check for injection
-        rules.append(("injection_detection", self._check_injection))
-        
-        # Execute rule chain
-        for rule_name, rule_fn in rules:
-            result = rule_fn(request)
-            rule_results.append(result)
-            if not result.passed:
-                block_reasons.append(f"[{rule_name}] {result.reason}")
-        
-        # Determine verdict
-        all_passed = all(r.passed for r in rule_results)
-        verdict = PolicyVerdict.ALLOW if all_passed else PolicyVerdict.BLOCK
-        
-        return PolicyResult(
-            verdict=verdict,
-            rule_results=rule_results,
-            block_reasons=block_reasons,
-        )
-    
-    # --- Rule Implementations ---
-    
-    def _check_contract_integrity(self, request: ActionRequest) -> RuleResult:
-        """Verify the contract hasn't been tampered with."""
-        is_valid = self.contract.verify_integrity()
-        return RuleResult(
-            rule_name="contract_integrity",
-            passed=is_valid,
-            reason="Contract integrity verified" if is_valid else "CONTRACT INTEGRITY FAILURE — possible tampering"
-        )
-    
-    def _check_agent_authorization(self, request: ActionRequest) -> RuleResult:
-        """Check that the agent role is recognized in the contract."""
-        perms = self.contract.get_agent_permissions(request.agent_role)
-        if perms is not None:
-            return RuleResult(
-                rule_name="agent_authorization",
-                passed=True,
-                reason=f"Agent role '{request.agent_role}' is authorized"
+
+        failed_checks = [c for c in checks if not c.passed]
+
+        if failed_checks:
+            primary_failure = failed_checks[0]
+            decision = EnforcementDecision(
+                result="BLOCK",
+                action_request=request,
+                reason=primary_failure.detail,
+                policy_violated=primary_failure.policy_name,
+                checks_run=checks,
+                timestamp=datetime.utcnow().isoformat(),
             )
-        return RuleResult(
-            rule_name="agent_authorization",
-            passed=False,
-            reason=f"Agent role '{request.agent_role}' is NOT authorized in contract"
-        )
-    
-    def _check_ticker(self, request: ActionRequest) -> RuleResult:
-        """Validate that the ticker is in the allowed universe."""
-        if request.ticker is None:
-            return RuleResult(
-                rule_name="ticker_check",
+        else:
+            # Update daily spend tracker on successful trade
+            if request.order_value_usd and request.action_type == "place_trade":
+                self._daily_spent += request.order_value_usd
+
+            decision = EnforcementDecision(
+                result="ALLOW",
+                action_request=request,
+                reason="All policy checks passed — action authorized",
+                policy_violated=None,
+                checks_run=checks,
+                timestamp=datetime.utcnow().isoformat(),
+            )
+
+        return decision
+
+    def _check_agent_registered(self, req: ActionRequest) -> PolicyCheck:
+        if req.agent_id not in self.contract.agent_scopes:
+            return PolicyCheck(
                 passed=False,
-                reason="No ticker specified in trade request"
+                policy_name="agent_registration",
+                detail=f"Agent '{req.agent_id}' is not registered in this session's IntentContract"
             )
-        is_allowed = self.contract.is_ticker_allowed(request.ticker)
-        if is_allowed:
-            return RuleResult(
-                rule_name="ticker_check",
-                passed=True,
-                reason=f"Ticker '{request.ticker}' is in the allowed universe"
-            )
-        return RuleResult(
-            rule_name="ticker_check",
-            passed=False,
-            reason=(
-                f"Ticker '{request.ticker}' is NOT in the allowed universe. "
-                f"Allowed: {self.contract.trade_constraints.allowed_tickers}"
-            )
-        )
-    
-    def _check_order_size(self, request: ActionRequest) -> RuleResult:
-        """Check that the order value is within per-order limits."""
-        if request.estimated_value is None:
-            return RuleResult(
-                rule_name="order_size_check",
-                passed=False,
-                reason="No estimated_value provided — cannot validate order size"
-            )
-        limit = self.contract.trade_constraints.max_order_value
-        if request.estimated_value <= limit:
-            return RuleResult(
-                rule_name="order_size_check",
-                passed=True,
-                reason=f"Order value ${request.estimated_value:,.2f} within limit ${limit:,.2f}"
-            )
-        return RuleResult(
-            rule_name="order_size_check",
-            passed=False,
-            reason=f"Order value ${request.estimated_value:,.2f} EXCEEDS per-order limit ${limit:,.2f}"
-        )
-    
-    def _check_daily_limit(self, request: ActionRequest) -> RuleResult:
-        """Check that the cumulative daily total is within limits."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if self._daily_date != today:
-            self._daily_totals.clear()
-            self._daily_date = today
-        
-        current_total = self._daily_totals.get(request.agent_role, 0.0)
-        new_total = current_total + (request.estimated_value or 0.0)
-        limit = self.contract.trade_constraints.max_daily_value
-        
-        if new_total <= limit:
-            # Update the running total
-            self._daily_totals[request.agent_role] = new_total
-            return RuleResult(
-                rule_name="daily_limit_check",
-                passed=True,
-                reason=f"Daily total ${new_total:,.2f} within limit ${limit:,.2f}"
-            )
-        return RuleResult(
-            rule_name="daily_limit_check",
-            passed=False,
-            reason=(
-                f"Daily total would be ${new_total:,.2f}, "
-                f"EXCEEDS daily limit ${limit:,.2f} "
-                f"(current: ${current_total:,.2f} + order: ${request.estimated_value:,.2f})"
-            )
-        )
-    
-    def _check_order_type(self, request: ActionRequest) -> RuleResult:
-        """Validate the order type is permitted."""
-        if request.order_type is None:
-            return RuleResult(
-                rule_name="order_type_check",
-                passed=True,
-                reason="No order type specified — defaulting to market (allowed)"
-            )
-        allowed = self.contract.trade_constraints.allowed_order_types
-        if request.order_type in allowed:
-            return RuleResult(
-                rule_name="order_type_check",
-                passed=True,
-                reason=f"Order type '{request.order_type}' is permitted"
-            )
-        return RuleResult(
-            rule_name="order_type_check",
-            passed=False,
-            reason=f"Order type '{request.order_type}' is NOT permitted. Allowed: {allowed}"
-        )
-    
-    def _check_trade_side(self, request: ActionRequest) -> RuleResult:
-        """Validate the trade side is permitted."""
-        if request.side is None:
-            return RuleResult(
-                rule_name="trade_side_check",
-                passed=False,
-                reason="No trade side specified in trade request"
-            )
-        allowed = self.contract.trade_constraints.allowed_sides
-        if request.side in allowed:
-            return RuleResult(
-                rule_name="trade_side_check",
-                passed=True,
-                reason=f"Trade side '{request.side}' is permitted"
-            )
-        return RuleResult(
-            rule_name="trade_side_check",
-            passed=False,
-            reason=f"Trade side '{request.side}' is NOT permitted. Allowed: {allowed}"
-        )
-    
-    def _check_tool_permission(self, request: ActionRequest) -> RuleResult:
-        """Check if the agent is allowed to use the requested tool."""
-        tool = request.tool_name
-        if tool is None:
-            # For trade actions, the implicit tool is 'place_order'
-            if request.action_type == "trade":
-                tool = "place_order"
-            else:
-                return RuleResult(
-                    rule_name="tool_permission_check",
+        return PolicyCheck(passed=True, policy_name="agent_registration")
+
+    def _check_action_in_agent_scope(self, req: ActionRequest) -> PolicyCheck:
+        if req.action_type == "use_tool" and req.tool_name:
+            agent_tools = self.contract.agent_scopes.get(req.agent_id, [])
+            if req.tool_name not in agent_tools:
+                return PolicyCheck(
                     passed=False,
-                    reason="No tool specified in tool_use request"
+                    policy_name="agent_scope",
+                    detail=f"Agent '{req.agent_id}' is not authorized to use '{req.tool_name}'. "
+                           f"Authorized tools: {agent_tools}"
                 )
-        
-        if self.contract.is_tool_allowed(request.agent_role, tool):
-            return RuleResult(
-                rule_name="tool_permission_check",
-                passed=True,
-                reason=f"Tool '{tool}' is allowed for role '{request.agent_role}'"
-            )
-        return RuleResult(
-            rule_name="tool_permission_check",
-            passed=False,
-            reason=f"Tool '{tool}' is NOT allowed for role '{request.agent_role}'"
-        )
-    
-    def _check_data_scope(self, request: ActionRequest) -> RuleResult:
-        """Validate file access is within the allowed data scope."""
-        if request.file_path is None:
-            return RuleResult(
-                rule_name="data_scope_check",
+        return PolicyCheck(passed=True, policy_name="agent_scope")
+
+    def _check_tool_not_forbidden(self, req: ActionRequest) -> PolicyCheck:
+        if req.tool_name and req.tool_name in self.contract.forbidden_tools:
+            return PolicyCheck(
                 passed=False,
-                reason="No file_path specified in data_access request"
+                policy_name="tool_restriction",
+                detail=f"Tool '{req.tool_name}' is in the forbidden tools list. "
+                       f"This tool cannot be invoked in any financial session."
             )
-        if self.contract.is_directory_allowed(request.file_path):
-            return RuleResult(
-                rule_name="data_scope_check",
-                passed=True,
-                reason=f"Path '{request.file_path}' is within allowed data scope"
-            )
-        return RuleResult(
-            rule_name="data_scope_check",
-            passed=False,
-            reason=(
-                f"Path '{request.file_path}' is OUTSIDE allowed data scope. "
-                f"Allowed: {self.contract.data_constraints.allowed_directories}"
-            )
-        )
-    
-    def _check_delegation_depth(self, request: ActionRequest) -> RuleResult:
-        """Check that delegation depth is within bounds."""
-        max_depth = self.contract.max_delegation_depth
-        if request.delegation_depth <= max_depth:
-            return RuleResult(
-                rule_name="delegation_depth_check",
-                passed=True,
-                reason=f"Delegation depth {request.delegation_depth} within limit {max_depth}"
-            )
-        return RuleResult(
-            rule_name="delegation_depth_check",
-            passed=False,
-            reason=(
-                f"Delegation depth {request.delegation_depth} EXCEEDS maximum {max_depth}. "
-                f"Chain: {request.delegated_from or 'unknown'} → {request.agent_id}"
-            )
-        )
-    
-    def _check_injection(self, request: ActionRequest) -> RuleResult:
-        """Detect potential prompt injection in agent reasoning."""
-        if request.raw_reasoning is None:
-            return RuleResult(
-                rule_name="injection_detection",
-                passed=True,
-                reason="No raw reasoning provided — skipping injection check"
-            )
-        
-        for pattern in COMPILED_PATTERNS:
-            match = pattern.search(request.raw_reasoning)
-            if match:
-                return RuleResult(
-                    rule_name="injection_detection",
+        return PolicyCheck(passed=True, policy_name="tool_restriction")
+
+    def _check_injection_patterns(self, req: ActionRequest) -> PolicyCheck:
+        content_to_scan = f"{req.tool_parameters} {req.raw_content}".lower()
+        for pattern in INJECTION_PATTERNS:
+            if re.search(pattern, content_to_scan):
+                return PolicyCheck(
                     passed=False,
-                    reason=f"PROMPT INJECTION DETECTED: matched pattern '{match.group()}' in agent reasoning"
+                    policy_name="prompt_injection_guard",
+                    detail=f"Potential prompt injection detected. Pattern matched: '{pattern}'. "
+                           f"Action blocked to prevent policy override via external content."
                 )
-        
-        return RuleResult(
-            rule_name="injection_detection",
-            passed=True,
-            reason="No injection patterns detected in agent reasoning"
-        )
-    
-    def _check_market_hours(self, request: ActionRequest) -> RuleResult:
-        """Check if trading is allowed at the current time."""
-        if not self.contract.trade_constraints.market_hours_only:
-            return RuleResult(
-                rule_name="market_hours_check",
-                passed=True,
-                reason="Market hours restriction is disabled"
+        return PolicyCheck(passed=True, policy_name="prompt_injection_guard")
+
+    def _check_ticker_restriction(self, req: ActionRequest) -> PolicyCheck:
+        if req.action_type != "place_trade" or not req.ticker:
+            return PolicyCheck(passed=True, policy_name="ticker_restriction")
+
+        allowed = self.contract.trade_policy.allowed_tickers
+        if req.ticker.upper() not in [t.upper() for t in allowed]:
+            return PolicyCheck(
+                passed=False,
+                policy_name="ticker_restriction",
+                detail=f"Ticker '{req.ticker}' is not in the approved universe: {allowed}. "
+                       f"Only pre-approved tickers may be traded in this session."
             )
-        
-        now = datetime.now(timezone.utc)
-        # NYSE hours: 9:30 AM - 4:00 PM ET (14:30 - 21:00 UTC)
-        market_open_utc = 14 * 60 + 30  # 14:30 UTC in minutes
-        market_close_utc = 21 * 60       # 21:00 UTC in minutes
-        current_minutes = now.hour * 60 + now.minute
-        weekday = now.weekday()
-        
-        is_weekday = weekday < 5
-        is_market_hours = market_open_utc <= current_minutes <= market_close_utc
-        
-        if is_weekday and is_market_hours:
-            return RuleResult(
-                rule_name="market_hours_check",
-                passed=True,
-                reason=f"Current time {now.strftime('%H:%M UTC')} is within market hours"
+        return PolicyCheck(passed=True, policy_name="ticker_restriction")
+
+    def _check_per_order_size(self, req: ActionRequest) -> PolicyCheck:
+        if req.action_type != "place_trade" or not req.order_value_usd:
+            return PolicyCheck(passed=True, policy_name="per_order_limit")
+
+        limit = self.contract.trade_policy.per_order_usd
+        if req.order_value_usd > limit:
+            return PolicyCheck(
+                passed=False,
+                policy_name="per_order_limit",
+                detail=f"Order value ${req.order_value_usd:.2f} exceeds per-order limit "
+                       f"of ${limit:.2f}. Reduce position size to proceed."
             )
-        
-        # For demo purposes, we'll allow but note the constraint
-        # In production, this would be a hard block
-        return RuleResult(
-            rule_name="market_hours_check",
-            passed=True,  # Soft pass for demo — set to False in production
-            reason=f"[DEMO MODE] Outside market hours ({now.strftime('%H:%M UTC')}, weekday={weekday}). Would block in production.",
-            severity="soft"
-        )
-    
-    def get_daily_total(self, agent_role: str) -> float:
-        """Get the current daily trading total for an agent role."""
-        return self._daily_totals.get(agent_role, 0.0)
-    
-    def reset_daily_totals(self):
-        """Reset daily totals (for testing)."""
-        self._daily_totals.clear()
-        self._daily_date = None
+        return PolicyCheck(passed=True, policy_name="per_order_limit")
+
+    def _check_daily_limit(self, req: ActionRequest) -> PolicyCheck:
+        if req.action_type != "place_trade" or not req.order_value_usd:
+            return PolicyCheck(passed=True, policy_name="daily_limit")
+
+        limit = self.contract.trade_policy.daily_usd
+        projected = self._daily_spent + req.order_value_usd
+        if projected > limit:
+            return PolicyCheck(
+                passed=False,
+                policy_name="daily_limit",
+                detail=f"This trade would bring daily total to ${projected:.2f}, "
+                       f"exceeding the ${limit:.2f} daily limit. "
+                       f"Current daily spend: ${self._daily_spent:.2f}."
+            )
+        return PolicyCheck(passed=True, policy_name="daily_limit")
+
+    def _check_share_quantity(self, req: ActionRequest) -> PolicyCheck:
+        if req.action_type != "place_trade" or not req.quantity:
+            return PolicyCheck(passed=True, policy_name="share_quantity")
+
+        max_shares = self.contract.trade_policy.max_shares_per_order
+        if req.quantity > max_shares:
+            return PolicyCheck(
+                passed=False,
+                policy_name="share_quantity",
+                detail=f"Requested {req.quantity} shares exceeds maximum of {max_shares} per order."
+            )
+        return PolicyCheck(passed=True, policy_name="share_quantity")
+
+    def _check_file_access_scope(self, req: ActionRequest) -> PolicyCheck:
+        if not req.file_path:
+            return PolicyCheck(passed=True, policy_name="file_access_scope")
+
+        action_requires_write = req.action_type in ["write_file", "delete_file"]
+        if action_requires_write:
+            allowed = self.contract.data_policy.writable_directories
+        else:
+            allowed = self.contract.data_policy.readable_directories
+
+        if not any(req.file_path.startswith(d) for d in allowed):
+            return PolicyCheck(
+                passed=False,
+                policy_name="file_access_scope",
+                detail=f"File path '{req.file_path}' is outside the permitted directories: {allowed}"
+            )
+        return PolicyCheck(passed=True, policy_name="file_access_scope")
+
+    def _check_delegation_bounds(self, req: ActionRequest) -> PolicyCheck:
+        if req.action_type != "delegate":
+            return PolicyCheck(passed=True, policy_name="delegation_bounds")
+
+        delegation = self.contract.delegation_policy
+        if req.agent_id == "trader-agent" and not delegation.trader_can_delegate:
+            return PolicyCheck(
+                passed=False,
+                policy_name="delegation_bounds",
+                detail="Trader agent is a terminal node — it cannot delegate authority. "
+                       "Delegation depth limit reached."
+            )
+        return PolicyCheck(passed=True, policy_name="delegation_bounds")
