@@ -1,0 +1,28 @@
+# Environment
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Audit logs (generated at runtime)
+audit_logs/*.jsonl
+
+# Streamlit
+.streamlit/
+
+# Misc
+*.egg-info/
+dist/
+build/
